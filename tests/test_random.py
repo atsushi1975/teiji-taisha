@@ -47,14 +47,7 @@ class RandomPlayTests(unittest.TestCase):
                         )
                     )
                     self.assertEqual(len(state.finish_order), num_players - 1)
-                    self.assertEqual(
-                        sorted(
-                            player.finish_rank
-                            for player in state.players
-                            if player.left
-                        ),
-                        list(range(1, num_players)),
-                    )
+                    self.assertEqual(set(outcome), {"type", "winners", "loser"})
 
     def test_same_seed_is_reproducible(self):
         first, first_steps = play_randomly(4, seed=123, chooser_seed=456)

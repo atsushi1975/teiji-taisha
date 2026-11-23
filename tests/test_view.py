@@ -30,6 +30,10 @@ class ViewTests(unittest.TestCase):
         for entry in mine["players"][1:]:
             with self.subTest(seat=entry["seat"]):
                 self.assertNotIn("hand", entry)
+        for entry in mine["players"]:
+            with self.subTest(seat=entry["seat"]):
+                self.assertNotIn("finish_rank", entry)
+                self.assertNotIn("rank", entry)
         self.assertEqual(
             [entry["hand_count"] for entry in mine["players"]], [3, 3, 2, 2]
         )

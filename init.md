@@ -53,14 +53,14 @@ teiji-taisha/
     test_turn.py      手番・引く位置・右隣の飛ばし・不正操作
     test_pair.py      ペア判定・3枚持ち・残業不可
     test_retire.py    退社（出す／引かれる／対象から外れる）
-    test_end.py       通常終了・順位・敗者
+    test_end.py       通常終了・勝者全員・一人負け（順位なし）
     test_effects.py   ノルマ・飲み会・エナドリ（連鎖）・会議・スタブ
     test_view.py      view_for（他人の手札非公開・枚数公開）
     test_json.py      to_dict / from_dict（乱数状態込みの往復）
     test_random.py    ランダムプレイの終了性・保存則・再現性
   init.md             このファイル
   README.md
-  LICENSE             All rights reserved（著作権者名は TODO）
+  LICENSE             All rights reserved（Originated by MottainaiGames / refined by Atsushi Sakamoto）
   .gitignore
   requirements.txt    今回は空
 ```
@@ -141,8 +141,9 @@ python3 -m unittest discover
 
 次のどちらかを満たした時点で、直ちに終了。
 
-- 通常終了: 最後に1人だけが残った。勝ち=退社した全員（先に退社した順に順位をつける）。
-  負け=最後まで『残業』を持っていた人。
+- 通常終了: 最後に1人だけが残った。勝ち=退社した全員（**順位はつけない**）。
+  負け=最後まで『残業』を持っていた人（**一人負け**）。
+  ※ 連戦モード構想: LIFE を 3 くらい用意して「neu」風にする案（ユーザーメモ。未実装）。
 - 労基終了: 『労基』で『残業』が公開された。大勝ち=『労基』を出した人、
   大負け=『残業』を暴かれた人、引き分け=それ以外の全員（退社済みも含む）。
 
@@ -233,8 +234,7 @@ python3 -m unittest discover
 
 ```python
 Card(id: str, copy: int)                     # frozen
-PlayerState(seat: int, hand: list[Card], left: bool = False,
-            finish_rank: Optional[int] = None)
+PlayerState(seat: int, hand: list[Card], left: bool = False)
 
 GameState(
     players: list[PlayerState],
@@ -246,7 +246,7 @@ GameState(
     extra_plays: int,               # エナドリによる追加出し回数
     drinking_blocked: Optional[int],# 次に出せない席（飲み会）
     meeting_declared: list[int],    # 会議で『残業』保持を宣言した席（全員公開）
-    finish_order: list[int],        # 退社した順の席番号
+    finish_order: list[int],        # 退社した順の席番号（履歴。順位ではない）
     end_reason: str,                # "" | "normal" | "labor"（1-A では normal のみ）
     labor_info: Optional[dict],     # 労基終了の詳細（枠のみ。1-A では None）
     shuffle_before_draw: bool,      # new_game 時に SHUFFLE_BEFORE_DRAW をコピー
@@ -257,7 +257,8 @@ GameState(
 
 - 山札は存在しない（49枚を全員に配り切る）。出したカードは `discarded` に積む。
 - 手札 + `discarded` の合計は常に 49。`tests/test_random.py` で毎手検証する。
-- 退社した人は `left=True` かつ `hand == []`。退社順は `finish_order` と `finish_rank`（1始まり）で持つ。
+- 退社した人は `left=True` かつ `hand == []`。`finish_order` は退社順の履歴だけを持ち、
+  **順位（`finish_rank` / `rank` / `standings`）は状態にも結果にも持たない**。
 - `phase` は 4 つ。`effect_input` は 1-B の同時選択用で、1-A では遷移しない。
 
 ### 5.4 アクション
@@ -338,11 +339,10 @@ play フェーズ
 # 通常終了（1-A で実装）
 {
     "type": "normal",
-    "winners": [退社した席を退社順に],   # 勝者全員
-    "loser": 残業保持者の席,             # 最後まで残業を持っていた人
-    "standings": [{"seat": 席, "rank": 1, "status": "retired"}, ...,
-                  {"seat": 敗者, "rank": N, "status": "loser"}],
+    "winners": [退社した席],   # 勝者全員。席番号順だが順位を表さない
+    "loser": 残業保持者の席,   # 最後まで残業を持っていた人（一人負け）
 }
+# rank / standings は含まない（ユーザー決定: 順位はつけない）
 
 # 労基終了（枠のみ。1-A では発火しない）
 {
@@ -447,6 +447,9 @@ play（ペアを出す）
 画像を直接読み取れない環境のため、`docs/original/rulebook-1.png` / `rulebook-2.png` を
 一時領域の OCR でテキスト化して照合した（プロジェクトには OCR 依存を追加していない）。
 
+※ ルールブック画像は**権利者に帰属するため Git 管理対象外**（`.gitignore` で除外）。
+   ローカルの参照用にだけ置き、clone には含まれない。上記は照合結果の記録である。
+
 確認できた点（いずれも 1-A の実装と整合）:
 
 - Q&A「ペアがある場合は自分の手番で必ず場に出さなければいけないですか？」→
@@ -473,30 +476,20 @@ play（ペアを出す）
 
 ---
 
-## 6. 未確定事項（完了報告で確認する質問）
+## 6. 確認済みの決定事項（2026-11-23 ユーザー回答）
 
-ルールにないことを推測で足さないため、以下は 1-A の仮決め／設計上の選択として実装し、確認する。
-原作ルールブックで解決できた項目は「（解決）」として残す。
+| 項目 | 決定 |
+| --- | --- |
+| 最初の手番 | **ランダムでOK**。原作の「直近で残業をした社員」には合わせない。 |
+| 引く位置 | `position`（0始まり）を残す。UI ではランダム位置を引く想定でOK。 |
+| 労基終了の `result` | 一旦 `{"type":"labor","big_win":...,"big_lose":...,"draws":[...]}` で進める（1-B で必要なら見直す）。 |
+| 順位 | **つけない**。退社した全員が勝者、残業を手元に残した1人だけが負け（一人負け）。`rank` / `standings` / `finish_rank` は実装から削除。 |
+| LICENSE 表記 | `Originated by MottainaiGames (refined by Atsushi Sakamoto). All rights reserved.` で一旦。**権利者への相談事項**。 |
+| リモート | `origin` に `https://github.com/atsushi1975/teiji-taisha.git` を設定してOK（push はしない）。 |
 
-1. **最初の手番**: 原作は「直近で残業をした社員」だが、依頼の「ランダム（仮決め）」で実装した。
-   1-B 以降で原作ルールに合わせるか、このままランダムでよいか。
-2. **引く位置の基底と UI**: ルール上は裏向きのカードを「引く」だけなので位置を選ぶ操作は存在しない。
-   指定通り `position`（0始まり）を `Action` に残すが、実卓相当の UI ではランダム位置を選ぶ想定でよいか。
-   （エンジンは引かれる側の手札を毎回シャッフルするため、位置の意味は毎回変わる）
-3. **会議の宣言タイミング（解決）**: 原作に「『会議』がプレイされた際」と明記。
-   実装（効果発動時）で合うため質問は不要。
-4. **エナドリの追加出しのタイミング（解決）**: 原作「このターン、追加でもう1回」＋
-   「このカードの効果でエナドリを出した場合、さらに追加でカードを出すことができる」より、
-   同じ手番内で継続＋連鎖可で合う。
-5. **`pass` とエナドリ（解決）**: 原作 Q&A で「必ず出す必要はない」と明記。
-   追加権が残っていても `pass` で手番を終了できる実装で合う。
-6. **労基終了の `result` 構造**: 上記 5.7 の `"type": "labor"` の形でよいか。
-   1-B で実装するときに変更したい項目はないか。
-7. **退社順の順位**: 原作「勝ち＝退社した社員全員（先に退社した順にエリート社員）」を、
-   `standings` では 1位＝最初に退社、敗者＝最下位、としている。希望の並び順はあるか。
-8. **LICENSE の著作権者名**: 指示通り `TODO` のままにしている。正式名称を教えてほしい。
-9. **リモート設定**: ローカルで `git init` してコミットのみ（push しない）。
-   `origin` を `https://github.com/atsushi1975/teiji-taisha.git` に設定しておいてよいか。
+原作ルールブックで解決した項目（会議の宣言タイミング、エナドリ連鎖、`pass` の可否、
+飲み会の処理、情報共有の同時選択）は 5A 節を参照。
+現在、未確定事項はなし。労基 `result` と LICENSE 表記は「一旦」の決定で、必要なら見直す。
 
 ---
 
@@ -510,9 +503,10 @@ play（ペアを出す）
 
 ### 検証（2026-11-23）
 
-- `python3 -m unittest discover`: **62 件すべて成功**（失敗・エラーなし）。
+- `python3 -m unittest discover`: **63 件すべて成功**（失敗・エラーなし）。
 - エンジンは標準ライブラリのみ。`requirements.txt` は空。
 - 原作ルールブックは `docs/original/` を OCR して照合済み（5A 節参照）。
+- ユーザー回答を反映: 順位なし（一人負け）、LICENSE 表記、`origin` 設定。
 - コミットは日本語メッセージのみ。push は行わない。
 
 ---
@@ -527,3 +521,6 @@ play（ペアを出す）
 - 『労基』だけは効果処理後に退社してもよい（3.6）。通常の即退社判定と順序を分ける。
 - CLI は 1-B で追加する。ルール判定は必ず `legal_actions` / `apply` を通し、CLI に実装しない。
 - Web UI は 2 以降。`view_for` の `players[].hand_count` を表示し、`hand` は本人にだけ渡す。
+- 一人負け方式につき、UI でも「順位」を表示しない。勝者は「退社済み」、敗者は「残業保持者」と表示する。
+- 連戦モード構想（ユーザーメモ。未実装）: LIFE を 3 くらい用意して「neu」風にする。
+  現在の `result()` は 1 対戦の一人負けのみを返すので、連戦は上位レイヤーで扱う。

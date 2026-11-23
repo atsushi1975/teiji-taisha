@@ -1,4 +1,4 @@
-"""通常終了（最後の1人・退社順の順位・敗者）のテスト。"""
+"""通常終了（退社した全員が勝者・残業保持者が一人負け）のテスト。"""
 
 import unittest
 
@@ -32,19 +32,21 @@ class EndTests(unittest.TestCase):
         self.assertIsNone(state.current_player)
         self.assertEqual(legal_actions(state), [])
 
-    def test_result_has_winners_in_retire_order_and_loser(self):
+    def test_result_has_all_winners_and_single_loser(self):
+        state = self._play_to_end()
+        self.assertEqual(
+            result(state),
+            {"type": "normal", "winners": [0, 1], "loser": 2},
+        )
+
+    def test_result_has_no_ranks_or_standings(self):
+        # 順位はつけない。退社順は履歴イベントにだけ残す。
         state = self._play_to_end()
         outcome = result(state)
-        self.assertEqual(outcome["type"], "normal")
-        self.assertEqual(outcome["winners"], [0, 1])
-        self.assertEqual(outcome["loser"], 2)
+        self.assertEqual(set(outcome), {"type", "winners", "loser"})
         self.assertEqual(
-            outcome["standings"],
-            [
-                {"seat": 0, "rank": 1, "status": "retired"},
-                {"seat": 1, "rank": 2, "status": "retired"},
-                {"seat": 2, "rank": 3, "status": "loser"},
-            ],
+            [event["payload"].get("rank") for event in state.events],
+            [None] * len(state.events),
         )
 
     def test_game_over_event_carries_result(self):

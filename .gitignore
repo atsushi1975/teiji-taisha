@@ -29,3 +29,6 @@ desktop.ini
 # 実行時生成物
 *.log
 instance/
+
+# 原作ルールブック（権利者のため管理対象外。ローカル参照用に残す）
+docs/original/

@@ -24,7 +24,6 @@ class RetireTests(unittest.TestCase):
         played = play_pair(state, 0, "quota")
         self.assertTrue(played.players[0].left)
         self.assertEqual(played.players[0].hand, [])
-        self.assertEqual(played.players[0].finish_rank, 1)
         self.assertEqual(played.finish_order, [0])
         self.assertEqual(len(played.discarded), 2)
         self.assertEqual(played.current_player, 1)
@@ -35,7 +34,7 @@ class RetireTests(unittest.TestCase):
         drawn = draw_at(state, 0, position=0)
         self.assertTrue(drawn.players[2].left)
         self.assertEqual(drawn.players[2].hand, [])
-        self.assertEqual(drawn.players[2].finish_rank, 1)
+        self.assertEqual(drawn.finish_order, [2])
         self.assertEqual(drawn.players[0].hand, cards("quota", "overtime"))
         self.assertEqual(drawn.phase, "play")
 

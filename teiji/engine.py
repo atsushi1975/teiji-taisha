@@ -151,8 +151,7 @@ def card_from_dict(data: dict[str, Any]) -> Card:
 class PlayerState:
     seat: int
     hand: list[Card] = field(default_factory=list)
-    left: bool = False  # 退社したか
-    finish_rank: Optional[int] = None  # 退社順（1始まり）。未退社は None
+    left: bool = False  # 退社したか（順位はつけない）
 
 
 @dataclass
@@ -570,13 +569,9 @@ def _retire(state: GameState, seat: int, *, reason: str) -> None:
     if player.hand:
         raise IllegalAction("手札が残っている席は退社できません")
     player.left = True
-    player.finish_rank = len(state.finish_order) + 1
+    # 退社順は履歴として残すが、順位はつけない（一人負け方式）。
     state.finish_order.append(seat)
-    _log(
-        state,
-        "retire",
-        {"seat": seat, "reason": reason, "rank": player.finish_rank},
-    )
+    _log(state, "retire", {"seat": seat, "reason": reason})
 
 
 def _end_turn(state: GameState) -> None:
@@ -591,8 +586,9 @@ def _end_turn(state: GameState) -> None:
 
 
 def _normal_result(state: GameState) -> dict[str, Any]:
-    """通常終了の結果を作る（勝者＝退社順、敗者＝残業保持者）。"""
-    winners = list(state.finish_order)
+    """通常終了の結果を作る（勝者＝退社した全員、敗者＝残業保持者の一人負け）。"""
+    # 席番号順に並べるが、これは順位を表さない。退社順の履歴は finish_order / イベントにある。
+    winners = sorted(state.finish_order)
     alive = [player for player in state.players if not player.left]
     loser = next(
         (
@@ -605,20 +601,7 @@ def _normal_result(state: GameState) -> dict[str, Any]:
     # 保険: 残業が見つからない場合は最後の在籍者を敗者とする。
     if loser is None and alive:
         loser = alive[-1].seat
-    standings = [
-        {"seat": seat, "rank": index + 1, "status": "retired"}
-        for index, seat in enumerate(winners)
-    ]
-    if loser is not None:
-        standings.append(
-            {"seat": loser, "rank": len(standings) + 1, "status": "loser"}
-        )
-    return {
-        "type": "normal",
-        "winners": winners,
-        "loser": loser,
-        "standings": standings,
-    }
+    return {"type": "normal", "winners": winners, "loser": loser}
 
 
 def _check_game_end(state: GameState) -> bool:
@@ -689,7 +672,6 @@ def view_for(state: GameState, seat: int) -> dict[str, Any]:
             "seat": player.seat,
             "hand_count": len(player.hand),
             "left": player.left,
-            "finish_rank": player.finish_rank,
         }
         if player.seat == seat:
             entry["hand"] = [card_to_dict(card) for card in player.hand]
@@ -741,7 +723,6 @@ def to_dict(state: GameState) -> dict[str, Any]:
                 "seat": player.seat,
                 "hand": [card_to_dict(card) for card in player.hand],
                 "left": player.left,
-                "finish_rank": player.finish_rank,
             }
             for player in state.players
         ],
@@ -769,11 +750,6 @@ def from_dict(data: dict[str, Any]) -> GameState:
             seat=int(player["seat"]),
             hand=[card_from_dict(card) for card in player.get("hand", [])],
             left=bool(player.get("left", False)),
-            finish_rank=(
-                None
-                if player.get("finish_rank") is None
-                else int(player["finish_rank"])
-            ),
         )
         for player in data["players"]
     ]

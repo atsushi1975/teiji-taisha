@@ -39,9 +39,9 @@ class TurnTests(unittest.TestCase):
         )
         self.assertEqual(drawn.phase, PHASE_PLAY)
         self.assertEqual(drawn.current_player, 0)
-        # 引いたカードの中身はイベントに出さない。
+        # 引いたカードの中身はイベントに出さない。公開は from/to/count のみ。
         draw_event = [e for e in drawn.events if e["kind"] == "draw"][-1]
-        self.assertEqual(draw_event["payload"], {"from": 5, "to": 0, "position": 1})
+        self.assertEqual(draw_event["payload"], {"from": 5, "to": 0, "count": 1})
 
     def test_draw_position_is_0_based_and_bounded(self):
         state = no_shuffle(new_game(3, seed=1, first_player=0))
@@ -107,8 +107,8 @@ class TurnTests(unittest.TestCase):
 
     def test_event_sequence_starts_after_deal(self):
         state = draw_at(new_game(3, seed=1, first_player=0), 0, 0)
-        self.assertEqual([event["seq"] for event in state.events], [0, 1])
-        self.assertEqual([event["kind"] for event in state.events], ["deal", "draw"])
+        self.assertEqual([event["seq"] for event in state.events], [0, 1, 2])
+        self.assertEqual([event["kind"] for event in state.events], ["deal", "draw", "card"])
 
 
 if __name__ == "__main__":

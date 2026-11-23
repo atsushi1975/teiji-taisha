@@ -9,8 +9,8 @@
 * 手番は「引く（強制）→ 出す（任意）」の順。ペアはカードの種類（id）で判定する。
 * ``legal_actions`` で合法手を列挙し、``apply`` で適用する。
 * ``apply`` は状態を破壊せず、新しい ``GameState`` を返す（内部で deepcopy）。
-* ``awaiting`` / ``pending`` は 1-B の同時選択用の枠。1-A では空のまま。
-* 公開情報と非公開情報は ``view_for`` で分ける。
+* ``awaiting`` / ``pending`` は効果入力待ち（1-B の同時選択含む）の枠。
+* 公開情報と非公開情報は ``view_for`` で分ける。イベントログも2層（``scope``）で分ける。
 * ``to_dict`` / ``from_dict`` で JSON と相互変換できる（乱数状態込み）。
 """
 
@@ -49,28 +49,13 @@ DECK_SIZE = sum(count for _card_id, count in CARD_SPECS)
 # False なら配布直後の手札位置として適用する（テスト・検証用）。
 SHUFFLE_BEFORE_DRAW = True
 
-# STUB_EFFECTS: 1-B で実装する7効果をスタブ（効果なし）にするフラグ。
-# スタブの対象は下の STUB_EFFECT_IDS。1-B で False にして実装に差し替える。
-STUB_EFFECTS = True
-STUB_EFFECT_IDS: frozenset[str] = frozenset(
-    {
-        "labor",
-        "romance",
-        "training",
-        "info_share",
-        "trade",
-        "power_harassment",
-        "smoke_break",
-    }
-)
-
 PHASE_DRAW = "draw"
 PHASE_PLAY = "play"
 PHASE_EFFECT_INPUT = "effect_input"
 PHASE_GAME_OVER = "game_over"
 
 END_REASON_NORMAL = "normal"
-END_REASON_LABOR = "labor"  # 枠のみ。1-A では発火しない。
+END_REASON_LABOR = "labor"  # 1-B で労基終了を実装。まだ発火しないわけではない。
 
 
 # ---------------------------------------------------------------------------
@@ -160,11 +145,14 @@ class GameState:
     discarded: list[Card]  # 場に出したカード（末尾が直近）
     current_player: Optional[int]
     phase: str = PHASE_DRAW  # draw | play | effect_input | game_over
-    awaiting: list[int] = field(default_factory=list)  # 今入力を待っている席（1-B 用）
-    pending: Optional[dict[str, Any]] = None  # 保留中の効果（1-B 用）
+    awaiting: list[int] = field(default_factory=list)  # 今入力を待っている席
+    pending: Optional[dict[str, Any]] = None  # 保留中の効果（5.9 のスキーマ）
     extra_plays: int = 0  # エナドリによる追加出し回数
     drinking_blocked: Optional[int] = None  # 飲み会で次に出せない席
-    meeting_declared: list[int] = field(default_factory=list)  # 会議で宣言した席（全員公開）
+    # 会議が発動された時点で「持っています」と宣言した席の履歴（全員公開）。
+    # 宣言後に『残業』は移動し得るため、現在の残業保持者を表す状態ではない。
+    # UI / CPU はこの値ではなくゲーム開始からのイベント履歴から行方を推定する前提とする。
+    meeting_declared: list[int] = field(default_factory=list)
     finish_order: list[int] = field(default_factory=list)  # 退社した順の席
     end_reason: str = ""  # "" | "normal" | "labor"
     labor_info: Optional[dict[str, Any]] = None  # 労基終了の詳細（枠のみ）
@@ -182,6 +170,7 @@ class Action:
     position: Optional[int] = None  # draw 用
     card: Optional[str] = None  # play 用（Card.id）
     target: Optional[int] = None  # effect_input / 将来の効果用（1-A では未使用）
+    positions: Optional[list[int]] = None  # 効果入力用（例: 新人教育の2枚位置）
 
     def to_dict(self) -> dict[str, Any]:
         """アクションを JSON 互換 dict に変換する。"""
@@ -191,17 +180,20 @@ class Action:
             "position": self.position,
             "card": self.card,
             "target": self.target,
+            "positions": None if self.positions is None else list(self.positions),
         }
 
     @staticmethod
     def from_dict(data: dict[str, Any]) -> "Action":
         """``to_dict`` の出力からアクションを復元する。"""
+        positions = data.get("positions")
         return Action(
             type=str(data["type"]),
             player=int(data["player"]),
             position=None if data.get("position") is None else int(data["position"]),
             card=None if data.get("card") is None else str(data["card"]),
             target=None if data.get("target") is None else int(data["target"]),
+            positions=None if positions is None else [int(value) for value in positions],
         )
 
 
@@ -254,6 +246,72 @@ def _log(
     if scope == "seats":
         event["seats"] = list(seats or [])
     state.events.append(event)
+
+
+def _log_move(
+    state: GameState,
+    move: str,
+    *,
+    frm: Any,
+    to: Any,
+    cards: list[Card],
+) -> None:
+    """カード移動を「誰から誰へ・何枚か」の公開イベントで記録する（中身なし）。"""
+    _log(state, move, {"from": frm, "to": to, "count": len(cards)})
+    if cards:
+        # 当事者（from と to）だけに中身を見せる。from == to の見せ合いは別イベントを使う。
+        _log(
+            state,
+            "card",
+            {"move": move, "from": frm, "to": to, "cards": [card_to_dict(card) for card in cards]},
+            scope="seats",
+            seats=[frm, to],
+        )
+
+
+def _log_reveal(
+    state: GameState,
+    *,
+    frm: Any,
+    to: Any,
+    cards: list[Card],
+    scope: str = "all",
+    seats: Optional[list[int]] = None,
+) -> None:
+    """公開（全員が見る）か、当事者のみが見るかを決めてイベントを残す。"""
+    _log(
+        state,
+        "reveal",
+        {
+            "from": frm,
+            "to": to,
+            "count": len(cards),
+            "cards": [card_to_dict(card) for card in cards],
+        },
+        scope=scope,
+        seats=seats,
+    )
+
+
+def _log_show(
+    state: GameState,
+    *,
+    frm: int,
+    to: int,
+    cards: list[Card],
+) -> None:
+    """2者間の見せ合い。移動は伴わず、情報の移動として当事者のみの中身を残す。"""
+    _log(
+        state,
+        "show",
+        {
+            "from": frm,
+            "to": to,
+            "cards": [card_to_dict(card) for card in cards],
+        },
+        scope="seats",
+        seats=[frm, to],
+    )
 
 
 def _visible(event: dict[str, Any], seat: int) -> bool:
@@ -334,19 +392,126 @@ def new_game(
 # ---------------------------------------------------------------------------
 
 
-def legal_actions(state: GameState) -> list[Action]:
+def _legal_effect_actions(state: GameState, actor: int) -> list[Action]:
+    """`pending` に応じて、入力待ちの席 ``actor`` の効果入力の合法手を返す。"""
+    if state.pending is None:
+        return []
+    effect = str(state.pending.get("effect") or "")
+    step = str(state.pending.get("step") or "")
+    data = state.pending.get("data") or {}
+
+    def candidates(predicate) -> list[int]:
+        return [seat for seat in range(len(state.players)) if predicate(seat)]
+
+    def alive_except(seat: int) -> bool:
+        return not state.players[seat].left and seat != actor
+
+    if effect == "labor":
+        if step == "select_target":
+            seats = candidates(lambda s: s != actor and not state.players[s].left and len(state.players[s].hand) >= 1)
+            return [Action(type="target", player=actor, target=t) for t in seats]
+        if step == "select_position":
+            order = [card_from_dict(card) for card in data.get("order") or []]
+            return [Action(type="position", player=actor, position=p) for p in range(len(order))]
+        if step == "choose_recipient":
+            owner = int(data.get("target") or 0)
+            seats = [
+                seat
+                for seat in range(len(state.players))
+                if seat != owner and (seat == actor or not state.players[seat].left)
+            ]
+            return [Action(type="recipient", player=owner, target=t) for t in seats]
+        return []
+    if effect == "power_harassment":
+        if step == "select_target":
+            seats = candidates(lambda s: s != actor and not state.players[s].left)
+            return [Action(type="target", player=actor, target=t) for t in seats]
+        if step == "select_position":
+            return [
+                Action(type="position", player=actor, position=p)
+                for p in range(len(state.players[actor].hand))
+            ]
+        return []
+    if effect == "romance":
+        if step == "select_target":
+            seats = candidates(alive_except)
+            return [Action(type="target", player=actor, target=t) for t in seats]
+        return []
+    if effect == "training":
+        if step == "select_target":
+            seats = candidates(lambda s: s != actor and not state.players[s].left and len(state.players[s].hand) >= 1)
+            return [Action(type="target", player=actor, target=t) for t in seats]
+        if step == "select_positions":
+            target = int(data.get("target") or 0)
+            hand_size = len(state.players[target].hand)
+            count = 2 if hand_size >= 2 else 1
+            seat_hand = state.players[target].hand
+            combos: list[tuple[int, ...]] = []
+            if count == 1:
+                combos = [(index,) for index in range(hand_size)]
+            else:
+                for first in range(hand_size):
+                    for second in range(first + 1, hand_size):
+                        combos.append((first, second))
+            return [Action(type="positions", player=actor, positions=list(combo)) for combo in combos]
+        if step == "choose_take":
+            actions: list[Action] = []
+            if not state.players[actor].left:
+                for index in range(len(data.get("viewed") or [])):
+                    actions.append(Action(type="take", player=actor, position=index))
+            actions.append(Action(type="skip", player=actor))
+            return actions
+        return []
+    if effect == "info_share":
+        if step == "collect":
+            actions: list[Action] = []
+            for seat in state.awaiting:
+                if seat != actor:
+                    continue
+                actions.extend(
+                    Action(type="select_card", player=seat, position=position)
+                    for position in range(len(state.players[seat].hand))
+                )
+            return actions
+        return []
+    if effect == "trade":
+        if step == "select_target":
+            seats = candidates(lambda s: s != actor and not state.players[s].left and len(state.players[s].hand) >= 1)
+            return [Action(type="target", player=actor, target=t) for t in seats]
+        if step == "collect":
+            actions = []
+            for seat in state.awaiting:
+                if seat != actor:
+                    continue
+                actions.extend(
+                    Action(type="select_card", player=seat, position=position)
+                    for position in range(len(state.players[seat].hand))
+                )
+            return actions
+        return []
+    return []
+
+
+def legal_actions(state: GameState, seat: Optional[int] = None) -> list[Action]:
     """現在入力待ちの席が選べる手をすべて返す。終了時は空リスト。
 
     ``awaiting`` が空なら手番の席、非空ならその席の入力として扱う
-    （1-B の同時選択用の分岐。1-A では ``awaiting`` は常に空）。
+    （1-B の同時選択用）。``seat`` を指定するとその席の視点で合法手を返す
+    （将来の CPU 用。指定した席が待っていなければ空リスト）。
     """
     if state.phase == PHASE_GAME_OVER:
         return []
-    actor = _actor(state)
-    if actor is None:
-        return []
     if state.phase == PHASE_EFFECT_INPUT:
-        # 1-A では effect_input には遷移しない。1-B で pending に基づき列挙する。
+        actor = _actor(state)
+        if actor is None:
+            return []
+        if seat is None:
+            seat = actor
+        if seat not in state.awaiting:
+            return []
+        return _legal_effect_actions(state, seat)
+    actor = _actor(state)
+    if actor is None or (seat is not None and seat != actor):
         return []
     if state.phase == PHASE_DRAW:
         source = draw_source(state, actor)
@@ -374,6 +539,23 @@ def legal_actions(state: GameState) -> list[Action]:
 # ---------------------------------------------------------------------------
 
 
+def _action_key(action: Action) -> tuple:
+    """アクションを比較用のタプルに変換する。"""
+    return (
+        action.type,
+        action.player,
+        action.position,
+        action.card,
+        action.target,
+        tuple(action.positions) if action.positions is not None else None,
+    )
+
+
+def _is_legal(state: GameState, action: Action) -> bool:
+    """その状態で ``action`` が合法手かどうか（awaiting / pending 含む）。"""
+    return any(_action_key(legal) == _action_key(action) for legal in legal_actions(state, action.player))
+
+
 def _validate(state: GameState, action: Action) -> None:
     """アクションの共通検証。不正なら TeijiError 系の例外を投げる。"""
     if not isinstance(action, Action):
@@ -383,10 +565,11 @@ def _validate(state: GameState, action: Action) -> None:
     actor = _actor(state)
     if actor is None:
         raise IllegalAction("操作を待っている席がいません")
-    if action.player != actor:
+    if state.awaiting:
+        if action.player not in state.awaiting:
+            raise NotYourTurn(f"席{action.player} は入力待ちの席ではありません")
+    elif action.player != actor:
         raise NotYourTurn(f"入力待ちは席{actor} です（操作: 席{action.player}）")
-    if state.awaiting and action.player not in state.awaiting:
-        raise NotYourTurn(f"席{action.player} は入力待ちの席ではありません")
 
     if action.type == "draw":
         if state.phase != PHASE_DRAW:
@@ -412,6 +595,37 @@ def _validate(state: GameState, action: Action) -> None:
             raise OvertimeNotPlayable("『残業』は場に出せません")
         if sum(1 for card in hand if card.id == action.card) < 2:
             raise PairNotAvailable(f"手札に {action.card} のペアがありません")
+    elif action.type in (
+        "target",
+        "position",
+        "positions",
+        "select_card",
+        "take",
+        "skip",
+        "recipient",
+    ):
+        if state.phase != PHASE_EFFECT_INPUT:
+            raise IllegalAction("今は効果の入力フェーズではありません")
+        if not _is_legal(state, action):
+            raise IllegalAction(
+                f"不正な効果入力です: type={action.type} player={action.player} "
+                f"position={action.position} positions={action.positions} target={action.target}"
+            )
+        if action.type == "target" and action.target is not None and isinstance(action.target, int):
+            pending = state.pending or {}
+            data = pending.get("data") or {}
+            if action.type == "recipient":
+                owner = int(data.get("target") or 0)
+                if action.player != owner:
+                    raise InvalidTarget("譲渡先の選択は公開されたパワハラの持ち主が行います")
+                recipient = action.target
+                if recipient == owner or (state.players[recipient].left and recipient != _actor(state)):
+                    raise InvalidTarget("譲渡先は自分自身または退社者ではいけません")
+            else:
+                target = action.target
+                actor_seat = actor
+                if target == actor_seat or state.players[target].left:
+                    raise InvalidTarget("対象には自分自身や退社者を指定できません")
     else:
         raise IllegalAction(f"未知のアクション種別です: {action.type}")
 
@@ -429,6 +643,18 @@ def apply(state: GameState, action: Action) -> GameState:
         _apply_pass(new_state, action)
     elif action.type == "play":
         _apply_play(new_state, action)
+    elif action.type in (
+        "target",
+        "position",
+        "positions",
+        "select_card",
+        "take",
+        "skip",
+        "recipient",
+    ):
+        _apply_effect_input(new_state, action)
+    else:
+        raise IllegalAction(f"未知のアクション種別です: {action.type}")
     return new_state
 
 
@@ -446,7 +672,8 @@ def _apply_draw(state: GameState, action: Action) -> None:
         state.rng.shuffle(hand)
     card = hand.pop(action.position)
     state.players[actor].hand.append(card)
-    _log(state, "draw", {"from": source, "to": actor, "position": action.position})
+    # 公開: 誰から誰へ・何枚か。中身は含めない（非公開の card イベントに分ける）。
+    _log_move(state, "draw", frm=source, to=actor, cards=[card])
 
     if not hand:
         _retire(state, source, reason="drawn")
@@ -483,57 +710,108 @@ def _apply_play(state: GameState, action: Action) -> None:
     for card in cards:
         player.hand.remove(card)
     state.discarded.extend(cards)
-    _log(
+    # 場に出したカードはルール場（全員から見える）へ移る。移動イベントに中身を残す。
+    _log(state, "play", {"from": actor, "to": "discarded", "count": len(cards)})
+    _log_reveal(
         state,
-        "play",
-        {
-            "seat": actor,
-            "card": action.card,
-            "copies": [card.copy for card in cards],
-        },
+        frm=actor,
+        to="discarded",
+        cards=cards,
+        scope="all",
     )
 
-    _apply_effect(state, actor, action.card)
-
-    if not player.hand:
-        # 出して0枚になった人は即退社。退社した人が発動した効果は既に処理済み。
+    entered_pending = False
+    # 『労基』だけは発動者の退社判定を効果解決後に遅らせる（3.6 / 5.12）。
+    # それ以外（即時効果・入力を要する効果）は、ペアを出した時点で退社判定を行う。
+    deferred_retire = action.card == "labor"
+    if not deferred_retire and not player.hand:
         _retire(state, actor, reason="played")
-    if _check_game_end(state):
+
+    entered_pending = _apply_effect(state, actor, action.card)
+
+    if entered_pending:
+        # 効果が入力を要する。労基だけは退社判定を効果解決後に遅らせるため、
+        # 発動者の退社はここでは行わない（deferred_retire の場合）。
+        # pending 中は終了判定しない。最終的に _resolve_pending / finalize で行う。
+        if _check_game_end(state):
+            return
+        if state.phase != PHASE_EFFECT_INPUT:
+            _advance_after_effect(state, actor, action.card)
         return
 
-    # エナドリ: このターン、追加でもう1回ペアを出してもよい（連鎖可）。
-    # 出して退社した人は追加出しを行使しない（手札が無いため）。
-    if player.left:
+    if not deferred_retire and state.players[actor].left:
+        # 即時効果を処理したあとに退社した場合は、終了判定してから手番を進める。
+        if _check_game_end(state):
+            return
         _end_turn(state)
         return
-    if action.card == "energy":
+    _advance_after_effect(state, actor, action.card)
+
+
+def _advance_after_effect(state: GameState, actor: int, card_id: str) -> None:
+    """効果を解決した後に、手番・エナドリ・退社を確定する。"""
+    if state.players[actor].left:
+        _end_turn(state)
+        return
+    if card_id == "energy":
         state.extra_plays += 1
     elif state.extra_plays > 0:
         state.extra_plays -= 1
-
     if state.extra_plays > 0:
         # 追加出しがある場合は同じ席で play フェーズを継続する。
         state.phase = PHASE_PLAY
-    else:
-        _end_turn(state)
+        return
+    _end_turn(state)
 
 
-def _apply_effect(state: GameState, actor: int, card_id: str) -> None:
-    """ペアを出した効果を処理する（1-A で実装する4種＋スタブ）。"""
+def _start_pending(
+    state: GameState,
+    *,
+    effect: str,
+    played_card: str,
+    actor: int,
+    step: str,
+    targets: list[int],
+    data: dict[str, Any],
+) -> None:
+    """効果入力待ちの状態（``phase="effect_input"``）へ遷移する。"""
+    state.pending = {
+        "effect": effect,
+        "played_card": played_card,
+        "actor": actor,
+        "step": step,
+        "targets": list(targets),
+        "responses": {},
+        "data": data,
+    }
+    state.awaiting = list(targets)
+    state.phase = PHASE_EFFECT_INPUT
+
+
+def _apply_effect(state: GameState, actor: int, card_id: str) -> bool:
+    """ペアを出した効果を処理する。
+
+    効果が入力を要する場合は ``phase="effect_input"`` へ遷移する（戻り値 ``True``）。
+    即時解決できる効果は戻り値 ``False`` で、通常どおり手番へ戻る処理を呼ぶ。
+
+    Returns:
+        True: 効果入力待ちになった（``phase`` は ``effect_input`` のまま）。
+        False: 効果を解決済みで、手番進行へ進む。
+    """
     if card_id == "quota":
         # ノルマ: 効果なし。
         _log(state, "effect", {"effect": "quota", "seat": actor})
-        return
+        return False
     if card_id == "drinking":
         # 飲み会: 次の手番の人はカードを出せない（退社済みは飛ばす）。
         target = next_alive(state, actor, 1)
         state.drinking_blocked = target
         _log(state, "effect", {"effect": "drinking", "seat": actor, "target": target})
-        return
+        return False
     if card_id == "energy":
         # エナドリ: 追加出し回数を増やす（解決は _apply_play 側）。
         _log(state, "effect", {"effect": "energy", "seat": actor})
-        return
+        return False
     if card_id == "meeting":
         # 会議: 残業を持つ人を全員に公開する。重複宣言は無視する。
         declared = [
@@ -545,20 +823,430 @@ def _apply_effect(state: GameState, actor: int, card_id: str) -> None:
             if seat not in state.meeting_declared:
                 state.meeting_declared.append(seat)
         _log(state, "effect", {"effect": "meeting", "seat": actor, "declared": declared})
-        return
-
-    if card_id in STUB_EFFECT_IDS:
-        # STUB_EFFECTS: 1-B で実装する効果。現状はペアを出せるだけで効果なし。
-        if not STUB_EFFECTS:
-            raise NotImplementedError(f"{card_id} の効果は 1-B で実装します")
-        _log(
-            state,
-            "effect",
-            {"effect": card_id, "seat": actor, "stub": True},
+        return False
+    if card_id == "labor":
+        # 労基: 発動者が対象を選び、対象の裏向き手札から位置で1枚を公開する。
+        # 発動者の退社は効果解決後に遅らせる（3.6 / 5.12）。
+        _start_pending(
+            state, effect="labor", played_card="labor", actor=actor,
+            step="select_target", targets=[actor], data={},
         )
-        return
+        _log(state, "effect", {"effect": "labor", "seat": actor, "step": "select_target", "targets": [actor]})
+        if not _legal_effect_actions(state, actor):
+            # 対象がいないため、即座に「元の手札に戻す」側で解決する。
+            _resolve_labor_after_position(state, state.pending)
+        return True
+    if card_id == "power_harassment":
+        # パワハラ: 発動者が対象を選び、自分の手札から1枚を渡す（入力を要する）。
+        _start_pending(
+            state, effect="power_harassment", played_card="power_harassment", actor=actor,
+            step="select_target", targets=[actor], data={},
+        )
+        _log(state, "effect", {"effect": "power_harassment", "seat": actor, "step": "select_target", "targets": [actor]})
+        if not _legal_effect_actions(state, actor):
+            # 対象がいないため、即座に効果を終了（渡せる手札が無い扱い）する。
+            _finish_pending_effect(state, state.pending)
+        return True
+    if card_id == "romance":
+        # 社内恋愛: 発動者が対象を選んで見せ合う（入力を要する）。
+        _start_pending(
+            state, effect="romance", played_card="romance", actor=actor,
+            step="select_target", targets=[actor], data={},
+        )
+        _log(state, "effect", {"effect": "romance", "seat": actor, "step": "select_target", "targets": [actor]})
+        if not _legal_effect_actions(state, actor):
+            # 対象がいないため、即座に効果を終了する。
+            _finish_pending_effect(state, state.pending)
+        return True
+    if card_id == "training":
+        # 新人教育: 発動者が対象を選び、2枚を見て任意に1枚を取る（入力を要する）。
+        _start_pending(
+            state, effect="training", played_card="training", actor=actor,
+            step="select_target", targets=[actor], data={},
+        )
+        _log(state, "effect", {"effect": "training", "seat": actor, "step": "select_target", "targets": [actor]})
+        if not _legal_effect_actions(state, actor):
+            # 対象がいないため、即座に効果を終了する。
+            _finish_pending_effect(state, state.pending)
+        return True
+    if card_id == "info_share":
+        # 情報共有: 在籍者全員が手札から1枚選び、揃ってから一斉に左隣へ渡す。
+        participants = [player.seat for player in state.players if not player.left]
+        _start_pending(
+            state, effect="info_share", played_card="info_share", actor=actor,
+            step="collect", targets=participants, data={},
+        )
+        state.awaiting = list(participants)
+        _log(state, "effect", {"effect": "info_share", "seat": actor, "targets": list(participants)})
+        return True
+    if card_id == "trade":
+        # 取引: 発動者が対象を選び、2人同時選択で1枚ずつ交換する（入力を要する）。
+        _start_pending(
+            state, effect="trade", played_card="trade", actor=actor,
+            step="select_target", targets=[actor], data={},
+        )
+        _log(state, "effect", {"effect": "trade", "seat": actor, "step": "select_target", "targets": [actor]})
+        if not _legal_effect_actions(state, actor):
+            # 対象がいないため、即座に効果を終了する。
+            _finish_pending_effect(state, state.pending)
+        return True
+    if card_id == "smoke_break":
+        # タバコ休憩: 在籍者全員が手札のタバコ休憩を全て場に出す。即時解決。
+        _resolve_smoke_break(state, actor)
+        _log(state, "effect", {"effect": "smoke_break", "seat": actor})
+        return False
 
     raise IllegalAction(f"未知のカード種別です: {card_id}")
+
+
+def _resolve_smoke_break(state: GameState, actor: int) -> None:
+    """タバコ休憩: 在籍者全員（発動者を含む）が手札のタバコ休憩を全て場に出す。"""
+    retiring: list[int] = []
+    for player in state.players:
+        if player.left:
+            continue
+        smoke_cards = [card for card in player.hand if card.id == "smoke_break"]
+        for card in smoke_cards:
+            player.hand.remove(card)
+        state.discarded.extend(smoke_cards)
+        _log(state, "play", {"from": player.seat, "to": "discarded", "count": len(smoke_cards)})
+        if smoke_cards:
+            _log_reveal(state, frm=player.seat, to="discarded", cards=smoke_cards, scope="all")
+        if not player.hand and player.seat not in retiring:
+            retiring.append(player.seat)
+    if retiring:
+        # 発動者の左隣から手番順に退社させる（仮決め）。
+        order: list[int] = []
+        for step in range(1, len(state.players) + 1):
+            seat = (actor + step) % len(state.players)
+            if seat in retiring and not state.players[seat].left:
+                order.append(seat)
+        for seat in order:
+            _retire(state, seat, reason="smoke_break")
+
+
+def _move_card(state: GameState, frm: int, to: int, card: Card, *, move: str = "give") -> None:
+    """カードを席から席へ移す（手札と場の合計を49枚に保つ）。``move`` は give（渡す）/ add（加える）。"""
+    state.players[frm].hand.remove(card)
+    state.players[to].hand.append(card)
+    _log_move(state, move, frm=frm, to=to, cards=[card])
+
+
+def _retire_if_empty(state: GameState, seat: int, *, reason: str) -> None:
+    """手札が0枚の席を退社させる（既に退社済みなら何もしない）。"""
+    player = state.players[seat]
+    if player.left or player.hand:
+        return
+    _retire(state, seat, reason=reason)
+
+
+def _finish_pending_effect(state: GameState, pending: dict[str, Any]) -> None:
+    """保留中の効果を解決し終わった後の後処理（退社・手番・エナドリ・終了）。"""
+    effect = str(pending.get("effect") or "")
+    actor = int(pending.get("actor") or 0)
+    played_card = str(pending.get("played_card") or "")
+    state.pending = None
+    state.awaiting = []
+    if effect == "labor":
+        # 労基: 発動者の退社は効果解決後に行う。
+        _retire_if_empty(state, actor, reason="played")
+        if _check_game_end(state):
+            return
+        _advance_after_effect(state, actor, played_card)
+        return
+    if state.players[actor].left:
+        _end_turn(state)
+        return
+    _advance_after_effect(state, actor, played_card)
+
+
+def _resolve_labor_after_position(state: GameState, pending: dict[str, Any]) -> None:
+    """労基の位置選択が済んだ後の解決（公開 → 分岐 → 退社・終了）。"""
+    data = pending.get("data")
+    if data is None:
+        data = {}
+        pending["data"] = data
+    revealed = data.get("revealed") or {}
+    card = (
+        Card(id=str(revealed.get("id") or ""), copy=int(revealed.get("copy") or 1))
+        if revealed
+        else None
+    )
+    actor = int(pending.get("actor") or 0)
+    if card is None or card.id not in ("overtime", "power_harassment"):
+        # 対象がいない／対象の手札に該当カードが無い場合は、元の手札に戻す（移動なし）。
+        _retire_if_empty(state, actor, reason="played")
+        _finish_pending_effect(state, pending)
+        return
+    if card.id == "overtime":
+        big_win = actor
+        big_lose = int(data.get("target") or 0)
+        draws = sorted(
+            player.seat
+            for player in state.players
+            if player.seat != big_win and player.seat != big_lose
+        )
+        state.end_reason = END_REASON_LABOR
+        state.labor_info = {"big_win": big_win, "big_lose": big_lose, "draws": draws}
+        state.phase = PHASE_GAME_OVER
+        state.current_player = None
+        state.awaiting = []
+        state.pending = None
+        state.extra_plays = 0
+        state.drinking_blocked = None
+        _log(state, "game_over", result(state))
+        _finish_pending_effect(state, pending)
+        return
+    if card.id == "power_harassment":
+        # 公開されたカードが『パワハラ』なら、譲渡先を選ぶ（入力待ち）。
+        owner = int(data.get("target") or 0)
+        pending["step"] = "choose_recipient"
+        state.awaiting = [owner]
+        return
+    # それ以外のカードは元の手札に戻す（移動なし）。
+    _log(state, "effect", {"effect": "labor", "seat": actor, "returned": True})
+    _retire_if_empty(state, actor, reason="played")
+    _finish_pending_effect(state, pending)
+
+
+def _apply_labor_input(state: GameState, pending: dict[str, Any], action: Action) -> None:
+    """労基の入力を処理する（対象 → 位置 → 公開 → 分岐）。"""
+    actor = int(pending.get("actor") or 0)
+    step = str(pending.get("step") or "")
+    data = pending.get("data")
+    if data is None:
+        data = {}
+        pending["data"] = data
+    if step == "select_target":
+        if action.type != "target" or action.target is None:
+            raise IllegalAction("労基の対象選択が不正です")
+        data["target"] = int(action.target)
+        order = list(state.players[int(action.target)].hand)
+        if state.shuffle_before_draw:
+            state.rng.shuffle(order)
+        data["order"] = [card_to_dict(card) for card in order]
+        pending["step"] = "select_position"
+        state.awaiting = [actor]
+        _log(state, "effect", {"effect": "labor", "seat": actor, "step": "select_position", "target": data["target"]})
+        return
+    if step == "select_position":
+        if action.type != "position" or action.position is None:
+            raise IllegalAction("労基の位置選択が不正です")
+        position = int(action.position)
+        order = [card_from_dict(card) for card in data.get("order") or []]
+        if not (0 <= position < len(order)):
+            raise IllegalAction("労基の位置が範囲外です")
+        card = order[position]
+        data["revealed"] = card_to_dict(card)
+        _log_reveal(state, frm=int(data.get("target") or 0), to="all", cards=[card], scope="all")
+        pending["step"] = "resolved"
+        _resolve_labor_after_position(state, pending)
+        return
+    if step == "choose_recipient":
+        if action.type != "recipient" or action.target is None:
+            raise IllegalAction("労基の譲渡先選択が不正です")
+        data["recipient"] = int(action.target)
+        _move_card(state, int(data.get("target") or 0), int(action.target), Card(id=str(data.get("revealed", {}).get("id") or ""), copy=int(data.get("revealed", {}).get("copy") or 1)))
+        _retire_if_empty(state, int(data.get("target") or 0), reason="power_harassment")
+        _retire_if_empty(state, actor, reason="played")
+        _finish_pending_effect(state, pending)
+        return
+    raise IllegalAction(f"未知の労基ステップです: {step}")
+
+
+def _apply_power_harassment_input(state: GameState, pending: dict[str, Any], action: Action) -> None:
+    """パワハラの入力を処理する（対象 → 自分の手札から1枚 → 渡す）。"""
+    actor = int(pending.get("actor") or 0)
+    step = str(pending.get("step") or "")
+    if step == "select_target":
+        if action.type != "target" or action.target is None:
+            raise IllegalAction("パワハラの対象選択が不正です")
+        pending["data"]["target"] = int(action.target)
+        # 発動者の手札が0枚なら、渡すカードが無いためここで効果を終了する（仮決め）。
+        if state.players[actor].left or not state.players[actor].hand:
+            _finish_pending_effect(state, pending)
+            return
+        pending["step"] = "select_position"
+        state.awaiting = [actor]
+        _log(state, "effect", {"effect": "power_harassment", "seat": actor, "step": "select_position", "target": int(action.target)})
+        return
+    if step == "select_position":
+        if not _legal_effect_actions(state, actor):
+            # 発動者の手札が無いため、渡すカードが無く即座に効果を終了する。
+            _finish_pending_effect(state, pending)
+            return
+        if action.type != "position" or action.position is None:
+            raise IllegalAction("パワハラのカード選択が不正です")
+        position = int(action.position)
+        hand = state.players[actor].hand
+        if not (0 <= position < len(hand)):
+            raise IllegalAction("パワハラのカード位置が範囲外です")
+        card = hand[position]
+        _move_card(state, actor, int((pending.get("data") or {}).get("target") or 0), card)
+        _retire_if_empty(state, actor, reason="played")
+        _finish_pending_effect(state, pending)
+        return
+    raise IllegalAction(f"未知のパワハラステップです: {step}")
+
+
+def _apply_romance_input(state: GameState, pending: dict[str, Any], action: Action) -> None:
+    """社内恋愛の入力を処理する（対象選択 → 見せ合い）。"""
+    actor = int(pending.get("actor") or 0)
+    step = str(pending.get("step") or "")
+    if step != "select_target":
+        raise IllegalAction(f"未知の社内恋愛ステップです: {step}")
+    if action.type != "target" or action.target is None:
+        raise IllegalAction("社内恋愛の対象選択が不正です")
+    target = int(action.target)
+    pending["data"]["target"] = target
+    # お互いの全手札を見せる。手札は移動しない。第三者には見えない。
+    _log_show(state, frm=actor, to=target, cards=list(state.players[actor].hand))
+    _log_show(state, frm=target, to=actor, cards=list(state.players[target].hand))
+    _finish_pending_effect(state, pending)
+
+
+def _apply_training_input(state: GameState, pending: dict[str, Any], action: Action) -> None:
+    """新人教育の入力を処理する（対象 → 2枚位置 → 任意の1枚）。"""
+    actor = int(pending.get("actor") or 0)
+    step = str(pending.get("step") or "")
+    data = pending.get("data")
+    if data is None:
+        data = {}
+        pending["data"] = data
+    if step == "select_target":
+        if action.type != "target" or action.target is None:
+            raise IllegalAction("新人教育の対象選択が不正です")
+        target = int(action.target)
+        data["target"] = target
+        order = list(state.players[target].hand)
+        if state.shuffle_before_draw:
+            state.rng.shuffle(order)
+        data["order"] = [card_to_dict(card) for card in order]
+        pending["step"] = "select_positions"
+        state.awaiting = [actor]
+        _log(state, "effect", {"effect": "training", "seat": actor, "step": "select_positions", "target": target})
+        return
+    if step == "select_positions":
+        if action.type != "positions" or not action.positions:
+            raise IllegalAction("新人教育の2枚選択が不正です")
+        positions = [int(value) for value in action.positions]
+        order = [card_from_dict(card) for card in data.get("order") or []]
+        viewed = [order[index] for index in positions if 0 <= index < len(order)]
+        data["viewed"] = [card_to_dict(card) for card in viewed]
+        pending["step"] = "choose_take"
+        _log(
+            state,
+            "reveal",
+            {"from": int(data.get("target") or 0), "to": actor, "count": len(viewed), "cards": data.get("viewed") or []},
+            scope="seats",
+            seats=[actor],
+        )
+        return
+    if step == "choose_take":
+        if action.type == "skip":
+            _finish_pending_effect(state, pending)
+            return
+        if action.type != "take" or action.position is None:
+            raise IllegalAction("新人教育のtakeが不正です")
+        index = int(action.position)
+        viewed = [card_from_dict(card) for card in data.get("viewed") or []]
+        if not (0 <= index < len(viewed)):
+            raise IllegalAction("新人教育のtake位置が範囲外です")
+        card = viewed[index]
+        _move_card(state, int(data.get("target") or 0), actor, card, move="add")
+        _finish_pending_effect(state, pending)
+        return
+    raise IllegalAction(f"未知の新人教育ステップです: {step}")
+
+
+def _apply_info_share_input(state: GameState, pending: dict[str, Any], action: Action) -> None:
+    """情報共有の入力を処理する（全員の入力が揃ったら一斉に左隣へ渡す）。"""
+    step = str(pending.get("step") or "")
+    if step != "collect":
+        raise IllegalAction(f"未知の情報共有ステップです: {step}")
+    responses = pending.setdefault("responses", {})
+    responses[str(action.player)] = action.to_dict()
+    waiting = [int(seat) for seat in (pending.get("targets") or state.awaiting)]
+    if not all(str(seat) in responses for seat in waiting):
+        # 全員の入力が揃うまで保留。まだ応答していない席だけを awaiting に残す。
+        state.awaiting = [seat for seat in waiting if str(seat) not in responses]
+        return
+    # 全員の入力が揃ったので、一斉に左隣の在籍者へ渡す。
+    data = pending.get("data") or {}
+    for seat in waiting:
+        action_for_seat = Action.from_dict(responses[str(seat)])
+        card = state.players[seat].hand[action_for_seat.position or 0]
+        recipient = next_alive(state, seat, 1)
+        _move_card(state, seat, recipient, card)
+    _finish_pending_effect(state, pending)
+
+
+def _apply_trade_input(state: GameState, pending: dict[str, Any], action: Action) -> None:
+    """取引の入力を処理する（2人の同時選択が揃ったら交換する）。"""
+    step = str(pending.get("step") or "")
+    data = pending.get("data")
+    if data is None:
+        data = {}
+        pending["data"] = data
+    if step == "select_target":
+        if action.type != "target" or action.target is None:
+            raise IllegalAction("取引の対象選択が不正です")
+        data["target"] = int(action.target)
+        # 発動者の手札が無ければ、ここで処理を終了する（仮決め: 渡せない場合は処理しない）。
+        if state.players[int(pending.get("actor") or 0)].left or not state.players[int(pending.get("actor") or 0)].hand:
+            _finish_pending_effect(state, pending)
+            return
+        pending["step"] = "collect"
+        state.awaiting = [int(pending.get("actor") or 0), int(action.target)]
+        pending["targets"] = list(state.awaiting)
+        _log(state, "effect", {"effect": "trade", "seat": int(pending.get("actor") or 0), "step": "collect", "target": int(action.target)})
+        return
+    if step != "collect":
+        raise IllegalAction(f"未知の取引ステップです: {step}")
+    responses = pending.setdefault("responses", {})
+    responses[str(action.player)] = action.to_dict()
+    actor = int(pending.get("actor") or 0)
+    target = int(data.get("target") or 0)
+    responses = pending.get("responses") or {}
+    awaiting = [int(seat) for seat in state.awaiting]
+    if str(actor) in responses and str(target) in responses:
+        actor_card = state.players[actor].hand[Action.from_dict(responses[str(actor)]).position or 0]
+        target_card = state.players[target].hand[Action.from_dict(responses[str(target)]).position or 0]
+        _move_card(state, actor, target, actor_card)
+        _move_card(state, target, actor, target_card)
+        _finish_pending_effect(state, pending)
+        return
+    # 2人分の入力が揃うまで保留。片方だけの入力では交換しない。
+    state.awaiting = [seat for seat in awaiting if str(seat) not in responses]
+
+
+def _apply_effect_input(state: GameState, action: Action) -> None:
+    """保留中の効果への入力（target / position / positions / select_card / take / skip / recipient）を適用する。"""
+    pending = state.pending
+    if pending is None:
+        raise IllegalAction("効果入力待ちの保留情報がありません")
+    effect = str(pending.get("effect") or "")
+    step = str(pending.get("step") or "")
+    action_player = int(action.player)
+    if effect == "labor":
+        _apply_labor_input(state, pending, action)
+        return
+    if effect == "power_harassment":
+        _apply_power_harassment_input(state, pending, action)
+        return
+    if effect == "romance":
+        _apply_romance_input(state, pending, action)
+        return
+    if effect == "training":
+        _apply_training_input(state, pending, action)
+        return
+    if effect == "info_share":
+        _apply_info_share_input(state, pending, action)
+        return
+    if effect == "trade":
+        _apply_trade_input(state, pending, action)
+        return
+    raise IllegalAction(f"未知の効果です: {effect}")
 
 
 def _retire(state: GameState, seat: int, *, reason: str) -> None:
@@ -656,6 +1344,20 @@ def visible_events(state: GameState, seat: int) -> list[dict[str, Any]]:
     return [event for event in state.events if _visible(event, seat)]
 
 
+def _pending_view(state: GameState, seat: int) -> Optional[dict[str, Any]]:
+    """その席視点の pending。他人の入力内容と内部データ（data）は見せない。"""
+    pending = state.pending
+    if pending is None:
+        return None
+    view: dict[str, Any] = dict(pending)
+    view.pop("data", None)
+    responses = pending.get("responses") or {}
+    own_key = str(seat)
+    view["responses"] = {own_key: responses[own_key]} if own_key in responses else {}
+    view["responded"] = [int(s) for s in state.awaiting if str(s) in responses]
+    return view
+
+
 def view_for(state: GameState, seat: int) -> dict[str, Any]:
     """``seat`` 視点の公開情報を返す。
 
@@ -682,7 +1384,7 @@ def view_for(state: GameState, seat: int) -> dict[str, Any]:
         "phase": state.phase,
         "current_player": state.current_player,
         "awaiting": list(state.awaiting),
-        "pending": None if state.pending is None else dict(state.pending),
+        "pending": _pending_view(state, seat),
         "extra_plays": state.extra_plays,
         "drinking_blocked": state.drinking_blocked,
         "meeting_declared": list(state.meeting_declared),

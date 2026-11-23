@@ -1,13 +1,10 @@
-"""効果4種（ノルマ・飲み会・エナドリ・会議）とスタブのテスト。"""
+"""効果（ノルマ・飲み会・エナドリ・会議・7効果）のテスト。"""
 
 import unittest
-from unittest.mock import patch
 
-from teiji.engine import STUB_EFFECT_IDS, STUB_EFFECTS, new_game, view_for
+from teiji.engine import Action, apply, is_game_over, new_game, result, view_for
 
-from .helpers import draw_at, ready_to_play
-
-from .helpers import cards, no_shuffle, play_pair, set_hands
+from .helpers import cards, draw_at, no_shuffle, play_pair, ready_to_play, set_hands
 
 
 def _state(num_players=3):
@@ -21,7 +18,7 @@ def _effect_events(state):
 
 
 class EffectsTests(unittest.TestCase):
-    """1-A で実装した4効果を確認する。"""
+    """1-A で実装した4効果と、1-B で実装した7効果を確認する。"""
 
     def test_quota_has_no_effect(self):
         state = _state(4)
@@ -38,7 +35,8 @@ class EffectsTests(unittest.TestCase):
     def test_drinking_blocks_next_player_until_draw(self):
         state = _state(4)
         state = set_hands(
-            state, {0: ["drinking", "drinking", "quota"], 1: ["quota", "quota"]}
+            state,
+            {0: ["drinking", "drinking", "quota"], 1: ["quota", "quota"]},
         )
         played = play_pair(state, 0, "drinking")
         self.assertEqual(played.drinking_blocked, 1)
@@ -98,8 +96,12 @@ class EffectsTests(unittest.TestCase):
         state = play_pair(state, 0, "meeting")
         self.assertEqual(state.extra_plays, 1)
         state = play_pair(state, 0, "labor")
-        self.assertEqual(state.extra_plays, 0)
-        self.assertEqual(state.current_player, 1)
+        self.assertEqual(state.extra_plays, 1)
+        self.assertEqual(state.pending["step"], "select_target")
+        after_target = apply(state, Action(type="target", player=0, target=1))
+        after_position = apply(after_target, Action(type="position", player=0, position=0))
+        self.assertEqual(after_position.extra_plays, 0)
+        self.assertEqual(after_position.current_player, 1)
 
     def test_energy_pair_can_be_played_without_extra_pair(self):
         # 追加で出せるペアがなくても、エナドリのペア自体は通常どおり出せる。
@@ -150,28 +152,226 @@ class EffectsTests(unittest.TestCase):
         self.assertEqual(played.meeting_declared, [0])
         self.assertEqual(played.players[0].hand, cards("overtime", "quota"))
 
-    def test_stub_effects_are_playable_but_have_no_effect(self):
-        # STUB_EFFECTS: 1-B で実装する7効果。現状はペアを出せるだけ。
-        self.assertTrue(STUB_EFFECTS)
-        for card_id in sorted(STUB_EFFECT_IDS):
-            with self.subTest(card_id=card_id):
-                state = set_hands(_state(), {0: [card_id, card_id, "quota"]})
-                played = play_pair(state, 0, card_id)
-                self.assertEqual(played.discarded, cards(card_id, card_id))
-                self.assertEqual(played.players[0].hand, cards("quota"))
-                self.assertIsNone(played.drinking_blocked)
-                self.assertEqual(played.extra_plays, 0)
-                self.assertEqual(played.meeting_declared, [])
-                self.assertEqual(played.finish_order, [])
-                event = _effect_events(played)[-1]
-                self.assertEqual(event["payload"]["effect"], card_id)
-                self.assertTrue(event["payload"]["stub"])
+    # ------------------------------------------------------------------
+    # 労基（labor）
+    # ------------------------------------------------------------------
 
-    def test_stub_flag_off_raises_not_implemented(self):
-        state = set_hands(_state(), {0: ["labor", "labor", "quota"]})
-        with patch("teiji.engine.STUB_EFFECTS", False):
-            with self.assertRaises(NotImplementedError):
-                play_pair(state, 0, "labor")
+    def test_labor_with_overtime_ends_game_with_labor_result(self):
+        state = _state(3)
+        state = set_hands(
+            state, {0: ["labor", "labor", "quota"], 1: ["overtime", "quota"], 2: ["quota", "quota"]}
+        )
+        played = play_pair(state, 0, "labor")
+        self.assertEqual(played.pending["step"], "select_target")
+        self.assertEqual(played.awaiting, [0])
+        after_target = apply(played, Action(type="target", player=0, target=1))
+        self.assertEqual(after_target.pending["step"], "select_position")
+        after_position = apply(after_target, Action(type="position", player=0, position=0))
+        self.assertTrue(is_game_over(after_position))
+        self.assertEqual(after_position.end_reason, "labor")
+        self.assertEqual(
+            result(after_position),
+            {"type": "labor", "big_win": 0, "big_lose": 1, "draws": [2]},
+        )
+        self.assertIsNone(after_position.pending)
+        self.assertEqual(after_position.awaiting, [])
+
+    def test_labor_with_other_card_returns_card_and_advances_turn(self):
+        state = _state(3)
+        state = set_hands(
+            state, {0: ["labor", "labor", "quota"], 1: ["quota", "quota"], 2: ["quota", "quota"]}
+        )
+        played = play_pair(state, 0, "labor")
+        after_target = apply(played, Action(type="target", player=0, target=1))
+        after_position = apply(after_target, Action(type="position", player=0, position=0))
+        self.assertIsNone(after_position.pending)
+        self.assertEqual(after_position.phase, "draw")
+        self.assertEqual(after_position.current_player, 1)
+        # 対象の手札は元のまま（カードは戻す）。
+        self.assertEqual([card.id for card in after_position.players[1].hand], ["quota", "quota"])
+        self.assertEqual([card.id for card in after_position.players[0].hand], ["quota"])
+
+    def test_labor_retires_actor_after_resolution(self):
+        state = _state(3)
+        state = set_hands(state, {0: ["labor", "labor"], 1: ["quota", "quota"], 2: ["quota", "quota"]})
+        played = play_pair(state, 0, "labor")
+        after_target = apply(played, Action(type="target", player=0, target=1))
+        after_position = apply(after_target, Action(type="position", player=0, position=0))
+        self.assertTrue(after_position.players[0].left)
+        self.assertEqual(after_position.finish_order, [0])
+
+    def test_labor_without_any_target_ends(self):
+        state = _state(3)
+        state = set_hands(state, {0: ["labor", "labor", "quota"], 1: [], 2: []})
+        state.players[1].left = True
+        state.players[2].left = True
+        played = play_pair(state, 0, "labor")
+        self.assertIsNone(played.pending)
+        self.assertTrue(is_game_over(played))
+
+    # ------------------------------------------------------------------
+    # パワハラ（power_harassment）
+    # ------------------------------------------------------------------
+
+    def test_power_harassment_gives_card_and_retires_actor(self):
+        state = _state(4)
+        state = set_hands(
+            state,
+            {
+                0: ["power_harassment", "power_harassment", "quota"],
+                1: ["quota", "quota"],
+                2: ["quota", "quota"],
+                3: ["quota", "quota"],
+            },
+        )
+        played = play_pair(state, 0, "power_harassment")
+        self.assertEqual(played.pending["step"], "select_target")
+        after_target = apply(played, Action(type="target", player=0, target=1))
+        self.assertEqual(after_target.pending["step"], "select_position")
+        after_position = apply(after_target, Action(type="position", player=0, position=0))
+        self.assertTrue(after_position.players[0].left)
+        self.assertIsNone(after_position.pending)
+        self.assertEqual(after_position.phase, "draw")
+        # 発動者が渡したのは手札の quota。受け取ったのは席1。
+        self.assertEqual([card.id for card in after_position.players[1].hand], ["quota", "quota", "quota"])
+        self.assertEqual(after_position.players[0].hand, [])
+
+    def test_power_harassment_ends_when_actor_has_no_card(self):
+        state = _state(3)
+        state = set_hands(state, {0: ["power_harassment", "power_harassment"], 1: ["quota", "quota"], 2: ["quota", "quota"]})
+        played = play_pair(state, 0, "power_harassment")
+        # 発動者は退職済み（手札0枚）なので、対象を選んでもここで終了する。
+        after_target = apply(played, Action(type="target", player=0, target=1))
+        self.assertIsNone(after_target.pending)
+        self.assertEqual(after_target.phase, "draw")
+
+    # ------------------------------------------------------------------
+    # 社内恋愛（romance）
+    # ------------------------------------------------------------------
+
+    def test_romance_shows_both_hands_to_each_other(self):
+        state = _state(3)
+        state = set_hands(
+            state,
+            {0: ["romance", "romance", "quota"], 1: ["quota", "quota"], 2: ["quota", "quota"]},
+        )
+        played = play_pair(state, 0, "romance")
+        self.assertEqual(played.pending["step"], "select_target")
+        after_target = apply(played, Action(type="target", player=0, target=1))
+        shows = [event for event in after_target.events if event["kind"] == "show"]
+        self.assertEqual(len(shows), 2)
+        self.assertEqual(shows[0]["scope"], "seats")
+        self.assertEqual(shows[0]["seats"], [0, 1])
+        self.assertEqual(shows[1]["scope"], "seats")
+        self.assertEqual(shows[1]["seats"], [1, 0])
+        self.assertIsNone(after_target.pending)
+        self.assertEqual(after_target.phase, "draw")
+        # 手札は移動しない。
+        self.assertEqual([card.id for card in after_target.players[0].hand], ["quota"])
+        self.assertEqual([card.id for card in after_target.players[1].hand], ["quota", "quota"])
+
+    # ------------------------------------------------------------------
+    # 新人教育（training）
+    # ------------------------------------------------------------------
+
+    def test_training_takes_one_of_two_shown_cards(self):
+        state = _state(3)
+        state = set_hands(
+            state,
+            {0: ["training", "training", "quota"], 1: ["quota", "quota", "quota"], 2: ["quota", "quota", "quota"]},
+        )
+        played = play_pair(state, 0, "training")
+        after_target = apply(played, Action(type="target", player=0, target=1))
+        after_positions = apply(after_target, Action(type="positions", player=0, positions=[0, 1]))
+        self.assertEqual(after_positions.pending["step"], "choose_take")
+        self.assertEqual([card["id"] for card in after_positions.pending["data"]["viewed"]], ["quota", "quota"])
+        taken = apply(after_positions, Action(type="take", player=0, position=0))
+        self.assertIsNone(taken.pending)
+        self.assertEqual([card.id for card in taken.players[0].hand], ["quota", "quota"])
+        self.assertEqual(len(taken.players[1].hand), 2)
+
+    def test_training_skip_takes_nothing(self):
+        state = _state(3)
+        state = set_hands(
+            state,
+            {0: ["training", "training", "quota"], 1: ["quota", "quota", "quota"], 2: ["quota", "quota", "quota"]},
+        )
+        played = play_pair(state, 0, "training")
+        after_target = apply(played, Action(type="target", player=0, target=1))
+        after_positions = apply(after_target, Action(type="positions", player=0, positions=[0, 1]))
+        skipped = apply(after_positions, Action(type="skip", player=0))
+        self.assertIsNone(skipped.pending)
+        self.assertEqual(skipped.phase, "draw")
+        # 手札は移動しない。
+        self.assertEqual(len(skipped.players[0].hand), 1)
+        self.assertEqual(len(skipped.players[1].hand), 3)
+
+    # ------------------------------------------------------------------
+    # 情報共有（info_share）
+    # ------------------------------------------------------------------
+
+    def test_info_share_gives_to_left_neighbor_after_all_input(self):
+        state = _state(3)
+        state = set_hands(
+            state,
+            {
+                0: ["info_share", "info_share", "quota"],
+                1: ["quota", "quota", "info_share"],
+                2: ["drinking", "drinking", "info_share"],
+            },
+        )
+        played = play_pair(state, 0, "info_share")
+        self.assertEqual(played.awaiting, [0, 1, 2])
+        self.assertEqual(played.pending["step"], "collect")
+        after_first = apply(played, Action(type="select_card", player=0, position=0))
+        self.assertEqual(after_first.awaiting, [1, 2])
+        after_second = apply(after_first, Action(type="select_card", player=1, position=0))
+        self.assertEqual(after_second.awaiting, [2])
+        resolved = apply(after_second, Action(type="select_card", player=2, position=0))
+        self.assertIsNone(resolved.pending)
+        self.assertEqual(resolved.phase, "draw")
+        # 全員の入力が揃ったら一斉に左隣へ渡す（0→1, 1→2, 2→0）。
+        self.assertEqual([card.id for card in resolved.players[0].hand], ["drinking"])
+        self.assertEqual([card.id for card in resolved.players[1].hand], ["quota", "info_share", "quota"])
+        self.assertEqual([card.id for card in resolved.players[2].hand], ["drinking", "info_share", "quota"])
+
+    # ------------------------------------------------------------------
+    # 取引（trade）
+    # ------------------------------------------------------------------
+
+    def test_trade_exchanges_cards_after_both_input(self):
+        state = _state(3)
+        state = set_hands(
+            state,
+            {0: ["trade", "trade", "labor", "quota"], 1: ["quota", "quota", "training"], 2: ["quota", "quota", "quota"]},
+        )
+        played = play_pair(state, 0, "trade")
+        after_target = apply(played, Action(type="target", player=0, target=1))
+        self.assertEqual(after_target.pending["step"], "collect")
+        after_actor_input = apply(after_target, Action(type="select_card", player=0, position=0))
+        self.assertEqual(after_actor_input.awaiting, [1])
+        after_target_input = apply(after_actor_input, Action(type="select_card", player=1, position=2))
+        self.assertIsNone(after_target_input.pending)
+        self.assertEqual([card.id for card in after_target_input.players[0].hand], ["quota", "training"])
+        self.assertEqual([card.id for card in after_target_input.players[1].hand], ["quota", "quota", "labor"])
+
+    # ------------------------------------------------------------------
+    # タバコ休憩（smoke_break）
+    # ------------------------------------------------------------------
+
+    def test_smoke_break_plays_all_and_retires(self):
+        state = _state(3)
+        state = set_hands(
+            state,
+            {0: ["smoke_break", "smoke_break", "quota"], 1: ["smoke_break"], 2: ["quota", "quota"]},
+        )
+        played = play_pair(state, 0, "smoke_break")
+        self.assertIsNone(played.pending)
+        self.assertEqual(played.phase, "draw")
+        # 席1が最後のタバコ休憩で退社する。
+        self.assertTrue(played.players[1].left)
+        self.assertEqual(played.finish_order, [1])
+        self.assertEqual([card.id for card in played.players[0].hand], ["quota"])
 
 
 if __name__ == "__main__":

@@ -5,7 +5,6 @@ import unittest
 from teiji.engine import (
     CARD_SPECS,
     DECK_SIZE,
-    STUB_EFFECT_IDS,
     build_deck,
     card_from_dict,
     card_to_dict,
@@ -43,21 +42,6 @@ class DeckTests(unittest.TestCase):
         deck = build_deck()
         identities = [(card.id, card.copy) for card in deck]
         self.assertEqual(len(set(identities)), 49)
-
-    def test_stub_effect_ids(self):
-        # 1-B で外す7効果。1-A ではペアを出せるだけで効果なし。
-        self.assertEqual(
-            STUB_EFFECT_IDS,
-            {
-                "labor",
-                "romance",
-                "training",
-                "info_share",
-                "trade",
-                "power_harassment",
-                "smoke_break",
-            },
-        )
 
     def test_card_dict_round_trip(self):
         from teiji.engine import Card

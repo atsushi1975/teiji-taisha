@@ -155,7 +155,7 @@ class GameState:
     meeting_declared: list[int] = field(default_factory=list)
     finish_order: list[int] = field(default_factory=list)  # 退社した順の席
     end_reason: str = ""  # "" | "normal" | "labor"
-    labor_info: Optional[dict[str, Any]] = None  # 労基終了の詳細（枠のみ）
+    labor_info: Optional[dict[str, Any]] = None  # 労基終了の敗者（{"loser": 席}）
     shuffle_before_draw: bool = SHUFFLE_BEFORE_DRAW
     events: list[dict[str, Any]] = field(default_factory=list)
     rng: random.Random = field(default_factory=random.Random)
@@ -979,23 +979,17 @@ def _resolve_labor_after_position(state: GameState, pending: dict[str, Any]) -> 
         _finish_pending_effect(state, pending)
         return
     if card.id == "overtime":
-        big_win = actor
-        big_lose = int(data.get("target") or 0)
-        draws = sorted(
-            player.seat
-            for player in state.players
-            if player.seat != big_win and player.seat != big_lose
-        )
         state.end_reason = END_REASON_LABOR
-        state.labor_info = {"big_win": big_win, "big_lose": big_lose, "draws": draws}
+        state.labor_info = {"loser": int(data.get("target") or 0)}
         state.phase = PHASE_GAME_OVER
         state.current_player = None
         state.awaiting = []
         state.pending = None
         state.extra_plays = 0
         state.drinking_blocked = None
+        # 発動者の退社は解決後に行い、終了イベントより前に記録する。
+        _retire_if_empty(state, actor, reason="played")
         _log(state, "game_over", result(state))
-        _finish_pending_effect(state, pending)
         return
     if card.id == "power_harassment":
         # 公開されたカードが『パワハラ』なら、譲渡先を選ぶ（入力待ち）。
@@ -1324,17 +1318,18 @@ def is_game_over(state: GameState) -> bool:
 def result(state: GameState) -> Optional[dict[str, Any]]:
     """ゲーム結果を返す。ゲーム中は None。
 
-    通常終了と労基終了の両方を表せる形にしてある。労基終了は 1-A では発火しない。
+    通常終了・労基終了ともに一人負け（type/winners/loser）で表す。
     """
     if not is_game_over(state):
         return None
     if state.end_reason == END_REASON_LABOR:
-        info = state.labor_info or {}
+        loser = (state.labor_info or {}).get("loser")
         return {
             "type": "labor",
-            "big_win": info.get("big_win"),
-            "big_lose": info.get("big_lose"),
-            "draws": list(info.get("draws") or []),
+            "winners": sorted(
+                player.seat for player in state.players if player.seat != loser
+            ),
+            "loser": loser,
         }
     return _normal_result(state)
 

@@ -2,7 +2,7 @@
 
 import unittest
 
-from teiji.engine import Action, apply, is_game_over, new_game, result, view_for
+from teiji.engine import Action, apply, is_game_over, legal_actions, new_game, result, view_for
 
 from .helpers import cards, draw_at, no_shuffle, play_pair, ready_to_play, set_hands
 
@@ -159,7 +159,7 @@ class EffectsTests(unittest.TestCase):
     def test_labor_with_overtime_ends_game_with_labor_result(self):
         state = _state(3)
         state = set_hands(
-            state, {0: ["labor", "labor", "quota"], 1: ["overtime", "quota"], 2: ["quota", "quota"]}
+            state, {0: ["labor", "labor"], 1: ["overtime", "quota"], 2: ["quota", "quota"]}
         )
         played = play_pair(state, 0, "labor")
         self.assertEqual(played.pending["step"], "select_target")
@@ -171,10 +171,16 @@ class EffectsTests(unittest.TestCase):
         self.assertEqual(after_position.end_reason, "labor")
         self.assertEqual(
             result(after_position),
-            {"type": "labor", "big_win": 0, "big_lose": 1, "draws": [2]},
+            {"type": "labor", "winners": [0, 2], "loser": 1},
         )
         self.assertIsNone(after_position.pending)
         self.assertEqual(after_position.awaiting, [])
+        # 発動者の退社が game_over より前に記録される。
+        self.assertEqual(
+            [event["kind"] for event in after_position.events][-2:],
+            ["retire", "game_over"],
+        )
+        self.assertEqual(after_position.finish_order, [0])
 
     def test_labor_with_other_card_returns_card_and_advances_turn(self):
         state = _state(3)
@@ -199,6 +205,29 @@ class EffectsTests(unittest.TestCase):
         after_position = apply(after_target, Action(type="position", player=0, position=0))
         self.assertTrue(after_position.players[0].left)
         self.assertEqual(after_position.finish_order, [0])
+
+    def test_labor_power_harassment_to_actor_keeps_actor_alive(self):
+        # 最後のペアで労基を出し、公開されたパワハラの渡し先に発動者本人を選ぶ。
+        state = _state(3)
+        state = set_hands(
+            state,
+            {0: ["labor", "labor"], 1: ["power_harassment", "quota"], 2: ["quota", "quota"]},
+        )
+        played = play_pair(state, 0, "labor")
+        after_target = apply(played, Action(type="target", player=0, target=1))
+        after_position = apply(after_target, Action(type="position", player=0, position=0))
+        self.assertEqual(after_position.pending["step"], "choose_recipient")
+        self.assertIn(
+            Action(type="recipient", player=1, target=0),
+            legal_actions(after_position),
+        )
+        resolved = apply(after_position, Action(type="recipient", player=1, target=0))
+        # 受け取って手札が1枚になったので、発動者は退社しない。
+        self.assertFalse(resolved.players[0].left)
+        self.assertEqual([card.id for card in resolved.players[0].hand], ["power_harassment"])
+        self.assertEqual([card.id for card in resolved.players[1].hand], ["quota"])
+        self.assertIsNone(resolved.pending)
+        self.assertEqual(resolved.phase, "draw")
 
     def test_labor_without_any_target_ends(self):
         state = _state(3)
@@ -334,6 +363,27 @@ class EffectsTests(unittest.TestCase):
         self.assertEqual([card.id for card in resolved.players[0].hand], ["drinking"])
         self.assertEqual([card.id for card in resolved.players[1].hand], ["quota", "info_share", "quota"])
         self.assertEqual([card.id for card in resolved.players[2].hand], ["drinking", "info_share", "quota"])
+
+    def test_info_share_skips_retired_actor_and_uses_remaining_alive(self):
+        # 発動者がペアを出して退社した後は、残りの在籍者だけで左隣へ渡す。
+        state = _state(3)
+        state = set_hands(
+            state,
+            {0: ["info_share", "info_share"], 1: ["quota", "quota"], 2: ["drinking", "drinking"]},
+        )
+        played = play_pair(state, 0, "info_share")
+        self.assertTrue(played.players[0].left)
+        self.assertEqual(played.awaiting, [1, 2])
+        after_first = apply(played, Action(type="select_card", player=1, position=0))
+        self.assertEqual(after_first.awaiting, [2])
+        resolved = apply(after_first, Action(type="select_card", player=2, position=0))
+        self.assertIsNone(resolved.pending)
+        self.assertEqual(resolved.phase, "draw")
+        # 退社した席0を飛ばして、1→2 に quota、2→1 に drinking が渡る。
+        self.assertEqual(resolved.players[0].hand, [])
+        self.assertEqual([card.id for card in resolved.players[1].hand], ["quota", "drinking"])
+        self.assertEqual([card.id for card in resolved.players[2].hand], ["drinking", "quota"])
+        self.assertEqual(resolved.current_player, 1)
 
     # ------------------------------------------------------------------
     # 取引（trade）

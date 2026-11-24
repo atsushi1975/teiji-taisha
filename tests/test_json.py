@@ -64,6 +64,18 @@ class JsonTests(unittest.TestCase):
         self.assertEqual(restored.extra_plays, 2)
         self.assertEqual(restored.end_reason, "normal")
 
+    def test_labor_info_round_trip(self):
+        state = no_shuffle(new_game(3, seed=5))
+        state.end_reason = "labor"
+        state.labor_info = {"loser": 2}
+        data = json.loads(json.dumps(to_dict(state)))
+        restored = from_dict(data)
+        self.assertEqual(data["labor_info"], {"loser": 2})
+        self.assertEqual(restored.end_reason, "labor")
+        self.assertEqual(restored.labor_info, {"loser": 2})
+        for key in ("big_win", "big_lose", "draws"):
+            self.assertNotIn(key, restored.labor_info)
+
 
 if __name__ == "__main__":
     unittest.main()

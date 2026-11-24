@@ -63,13 +63,13 @@ class EndTests(unittest.TestCase):
             draw_at(state, 2, 0)
 
     def test_labor_result_frame_is_available(self):
-        # 枠だけ。1-A では労基終了は発火しない。
+        # 労基終了も一人負けの結果フレーム（type だけが異なる）。
         state = self._play_to_end()
         state.end_reason = "labor"
-        state.labor_info = {"big_win": 0, "big_lose": 2, "draws": [1]}
+        state.labor_info = {"loser": 2}
         self.assertEqual(
             result(state),
-            {"type": "labor", "big_win": 0, "big_lose": 2, "draws": [1]},
+            {"type": "labor", "winners": [0, 1], "loser": 2},
         )
 
 

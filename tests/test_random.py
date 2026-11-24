@@ -37,22 +37,30 @@ class RandomPlayTests(unittest.TestCase):
                     self.assertLess(steps, MAX_STEPS)
                     self.assertEqual(card_total(state), 49)
                     outcome = result(state)
-                    if outcome["type"] == "labor":
-                        # 労基終了は労基終了の結果フレームで終わる。
-                        self.assertEqual(set(outcome), {"type", "big_win", "big_lose", "draws"})
-                        self.assertTrue(is_game_over(state))
-                    else:
-                        self.assertEqual(outcome["type"], "normal")
-                        self.assertEqual(len(outcome["winners"]), num_players - 1)
-                        loser = outcome["loser"]
+                    self.assertIn(outcome["type"], ("normal", "labor"))
+                    self.assertEqual(set(outcome), {"type", "winners", "loser"})
+                    self.assertEqual(len(outcome["winners"]), num_players - 1)
+                    self.assertEqual(len(set(outcome["winners"])), num_players - 1)
+                    self.assertNotIn(outcome["loser"], outcome["winners"])
+                    self.assertEqual(
+                        outcome["winners"],
+                        sorted(seat for seat in range(num_players) if seat != outcome["loser"]),
+                    )
+                    for key in ("big_win", "big_lose", "draws"):
+                        self.assertNotIn(key, outcome)
+                        self.assertNotIn(key, state.labor_info or {})
+                    if outcome["type"] == "normal":
+                        self.assertEqual(outcome["winners"], sorted(state.finish_order))
                         self.assertTrue(
                             any(
                                 card.id == "overtime"
-                                for card in state.players[loser].hand
+                                for card in state.players[outcome["loser"]].hand
                             )
                         )
                         self.assertEqual(len(state.finish_order), num_players - 1)
-                        self.assertEqual(set(outcome), {"type", "winners", "loser"})
+                    else:
+                        self.assertEqual(state.end_reason, "labor")
+                        self.assertEqual(state.labor_info, {"loser": outcome["loser"]})
 
     def test_same_seed_is_reproducible(self):
         first, first_steps = play_randomly(4, seed=123, chooser_seed=456)
